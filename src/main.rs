@@ -95,7 +95,7 @@ fn main() {
                         }
                     };
 
-                    repl::query_print::print_query_result(&term, attrs)
+                    repl::query_print::write_query_result(&term, attrs)
                 })
             }
             Some(Command::Typecheck) => program.typecheck().map(|_| ()),

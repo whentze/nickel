@@ -7,17 +7,20 @@
 //! jupyter-kernel (which is not exactly user-facing, but still manages input/output and
 //! formatting), etc.
 use crate::cache::Cache;
-use crate::error::{Error, EvalError, IOError};
-use crate::error::{ParseError, REPLError};
+use crate::error::{Error, EvalError, IOError, ParseError, REPLError};
 use crate::identifier::Ident;
 use crate::parser::{grammar, lexer, ExtendedTerm};
 use crate::term::{RichTerm, Term};
 use crate::types::Types;
 use crate::{eval, transformations, typecheck};
+use codespan::FileId;
 use simple_counter::*;
 use std::ffi::{OsStr, OsString};
 use std::result::Result;
 use std::str::FromStr;
+
+#[cfg(feature = "repl")]
+use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 
 generate_counter!(InputNameCounter, usize);
 
@@ -308,6 +311,82 @@ pub mod command {
     }
 }
 
+/// Error occurring when initializing the REPL.
+pub enum InitError {
+    /// Unable to load, parse or typecheck the stdlib
+    Stdlib,
+}
+
+pub enum InputStatus {
+    Complete(ExtendedTerm),
+    Partial,
+    Command,
+    Failed(ParseError),
+}
+
+/// Validator enabling multiline input.
+///
+/// The behavior is the following:
+/// - always end an input that starts with the command prefix `:`
+/// - otherwise, try to parse the input. If an unexpected end of file error occurs, continue
+///   the input in a new line. Otherwise, accept and end the input.
+//TODO: the validator throws away the result of parsing, or the parse error, when accepting an
+//input, meaning that the work is done a second time by the REPL. Validator's work could be
+//reused. This overhead shouldn't be dramatic for the typical REPL input size, though.
+#[cfg_attr(
+    feature = "repl",
+    derive(
+        rustyline_derive::Completer,
+        rustyline_derive::Helper,
+        rustyline_derive::Highlighter,
+        rustyline_derive::Hinter
+    )
+)]
+pub struct InputParser {
+    parser: grammar::ExtendedTermParser,
+    /// Currently the parser expect a `FileId` to fill in location information. For this
+    /// validator, this may be a dummy one, since for now location information is not used.
+    file_id: FileId,
+}
+
+impl InputParser {
+    pub fn new(file_id: FileId) -> Self {
+        InputParser {
+            parser: grammar::ExtendedTermParser::new(),
+            file_id,
+        }
+    }
+
+    pub fn parse(&self, input: &str) -> InputStatus {
+        if input.starts_with(':') || input.trim().is_empty() {
+            return InputStatus::Command;
+        }
+
+        let result = self
+            .parser
+            .parse(self.file_id, lexer::Lexer::new(input))
+            .map_err(|err| ParseError::from_lalrpop(err, self.file_id));
+
+        match result {
+            Ok(t) => InputStatus::Complete(t),
+            Err(ParseError::UnexpectedEOF(..)) | Err(ParseError::UnmatchedCloseBrace(..)) => {
+                InputStatus::Partial
+            }
+            Err(err) => InputStatus::Failed(err),
+        }
+    }
+}
+
+#[cfg(feature = "repl")]
+impl rustyline::validate::Validator for InputParser {
+    fn validate(&self, ctx: &mut ValidationContext<'_>) -> rustyline::Result<ValidationResult> {
+        match self.parse(ctx.input()) {
+            InputStatus::Partial => Ok(ValidationResult::Invalid(None)),
+            _ => Ok(ValidationResult::Valid(None)),
+        }
+    }
+}
+
 /// Native terminal implementation of an REPL frontend using rustyline.
 #[cfg(feature = "repl")]
 pub mod rustyline_frontend {
@@ -320,63 +399,8 @@ pub mod rustyline_frontend {
     use codespan::FileId;
     use rustyline::config::OutputStreamType;
     use rustyline::error::ReadlineError;
-    use rustyline::validate::{ValidationContext, ValidationResult, Validator};
     use rustyline::{Config, EditMode, Editor};
     use rustyline_derive::{Completer, Helper, Highlighter, Hinter};
-
-    /// Validator enabling multiline input.
-    ///
-    /// The behavior is the following:
-    /// - always end an input that starts with the command prefix `:`
-    /// - otherwise, try to parse the input. If an unexpected end of file error occurs, continue
-    ///   the input in a new line. Otherwise, accept and end the input.
-    //TODO: the validator throws away the result of parsing, or the parse error, when accepting an
-    //input, meaning that the work is done a second time by the REPL. Validator's work could be
-    //reused. This overhead shouldn't be dramatic for the typical REPL input size, though.
-    #[derive(Completer, Helper, Highlighter, Hinter)]
-    pub struct MultilineValidator {
-        parser: grammar::ExtendedTermParser,
-        /// Currently the parser expect a `FileId` to fill in location information. For this
-        /// validator, this may be a dummy one, since for now location information is not used.
-        file_id: FileId,
-    }
-
-    impl MultilineValidator {
-        fn new(file_id: FileId) -> Self {
-            MultilineValidator {
-                parser: grammar::ExtendedTermParser::new(),
-                file_id,
-            }
-        }
-    }
-
-    impl Validator for MultilineValidator {
-        fn validate(&self, ctx: &mut ValidationContext<'_>) -> rustyline::Result<ValidationResult> {
-            let input = ctx.input();
-
-            if input.starts_with(':') || input.trim().is_empty() {
-                return Ok(ValidationResult::Valid(None));
-            }
-
-            let result = self
-                .parser
-                .parse(self.file_id, lexer::Lexer::new(ctx.input()))
-                .map_err(|err| ParseError::from_lalrpop(err, self.file_id));
-
-            match result {
-                Err(ParseError::UnexpectedEOF(..)) | Err(ParseError::UnmatchedCloseBrace(..)) => {
-                    Ok(ValidationResult::Invalid(None))
-                }
-                _ => Ok(ValidationResult::Valid(None)),
-            }
-        }
-    }
-
-    /// Error occurring when initializing the REPL.
-    pub enum InitError {
-        /// Unable to load, parse or typecheck the stdlib
-        Stdlib,
-    }
 
     /// The config of rustyline's editor.
     pub fn config() -> Config {
@@ -399,8 +423,7 @@ pub mod rustyline_frontend {
             }
         }
 
-        let validator =
-            MultilineValidator::new(repl.cache_mut().add_tmp("<repl-input>", String::new()));
+        let validator = InputParser::new(repl.cache_mut().add_tmp("<repl-input>", String::new()));
 
         let mut editor = Editor::with_config(config());
         editor.set_helper(Some(validator));
@@ -412,6 +435,9 @@ pub mod rustyline_frontend {
             if let Ok(line) = line.as_ref() {
                 editor.add_history_entry(line.clone());
             }
+
+
+            let stdout = std::io::stdout();
 
             match line {
                 Ok(line) if line.trim().is_empty() => (),
@@ -430,10 +456,10 @@ pub mod rustyline_frontend {
                             repl.typecheck(&exp).map(|types| println!("Ok: {}", types))
                         }
                         Ok(Command::Query(exp)) => repl.query(&exp).map(|t| {
-                            query_print::print_query_result(&t, query_print::Attributes::default());
+                            query_print::write_query_result(&mut stdout, &t, query_print::Attributes::default());
                         }),
                         Ok(Command::Help(arg)) => {
-                            print_help(arg.as_deref());
+                            simple_frontend::print_help(&mut std::io::stdout(), arg.as_deref()).unwrap();
                             Ok(())
                         }
                         Ok(Command::Exit) => {
@@ -470,59 +496,146 @@ pub mod rustyline_frontend {
             }
         }
     }
+}
+
+/// Simple UI-agnostic interface to the REPL, taking string inputs and returning string inputs.
+// #[cfg(feature = "repl-wasm")]
+pub mod simple_frontend {
+    use super::command::{Command, CommandType, UnknownCommandError};
+    use super::*;
+    use crate::error::ParseError;
+    use crate::program;
+    use codespan::FileId;
+    use std::fmt::Formatter;
+    use std::io::{Write, Cursor};
+
+    pub enum InputResult {
+        Success(String),
+        Blank,
+        Partial,
+    }
+
+    pub fn init() -> Result<REPLImpl, InitError> {
+        let mut repl = REPLImpl::new();
+
+        match repl.load_stdlib() {
+            Ok(()) => (),
+            Err(err) => {
+                program::report(repl.cache_mut(), err);
+                return Err(InitError::Stdlib);
+            }
+        }
+
+        Ok(repl)
+    }
+
+    pub fn input<R : REPL>(repl: &mut R, line: &str) -> Result<InputResult, String> {
+              if line.trim().is_empty() {
+                  Ok(InputResult::Blank)
+              }
+              else if line.starts_with(':') {
+                  let cmd = line.chars().skip(1).collect::<String>().parse::<Command>();
+                  let result = match cmd {
+                      Ok(Command::Load(path)) => {
+                        return Err(String::from(":load is not enabled on the online REPL.")); 
+                      }
+                      Ok(Command::Typecheck(exp)) => {
+                          repl.typecheck(&exp).map(|types| InputResult::Success(format!("Ok: {}", types)))
+                      }
+                      Ok(Command::Query(exp)) =>
+                          repl.query(&exp).map(|t| {  
+                              let mut buffer = Cursor::new(Vec::<u8>::new());
+                              query_print::write_query_result(&mut buffer, &t, query_print::Attributes::default());
+                              InputResult::Success(buffer.into_inner().try_into().unwrap())
+                      }),
+                      Ok(Command::Help(arg)) => {
+                          let mut buffer = Cursor::new(Vec::<u8>::new());
+                          simple_frontend::print_help(&mut , arg.as_deref()).unwrap();
+                          Ok(())
+                      }
+                      Ok(Command::Exit) => {
+                          println!("{}", Style::new().bold().paint("Exiting"));
+                          return Ok(());
+                      }
+                      Err(err) => Err(Error::from(err)),
+                  };
+
+                  if let Err(err) = result {
+                      program::report(repl.cache_mut(), err);
+                  } else {
+                      println!();
+                  }
+              }
+              else {
+                  match repl.eval(&line) {
+                      Ok(EvalResult::Evaluated(t)) => Ok(InputResult::Success(format!("{}\n", t.shallow_repr()))),
+                      Ok(EvalResult::Bound(_)) => Ok(InputResult::Success(String::new())),
+                      Err(err) => Err(err.to_diagnostic().to_string()),
+                  }
+              }
+    }
 
     /// Print the help message corresponding to a command, or show a list of available commands if
     /// the argument is `None` or is not a command.
-    fn print_help(arg: Option<&str>) {
+    pub fn print_help(out: &mut impl Write, arg: Option<&str>) -> std::io::Result<()> {
         if let Some(arg) = arg {
-            fn print_aliases(cmd: CommandType) {
+            fn print_aliases(w: &mut impl Write, cmd: CommandType) -> std::io::Result<()> {
                 let mut aliases = cmd.aliases().into_iter();
 
                 if let Some(fst) = aliases.next() {
-                    print!("Aliases: `{}`", fst);
-                    aliases.for_each(|alias| print!(", `{}`", alias));
-                    println!();
+                    write!(w, "Aliases: `{}`", fst)?;
+                    aliases.try_for_each(|alias| write!(w, ", `{}`", alias))?;
+                    writeln!(w)?;
                 }
 
-                println!();
+                writeln!(w)
             }
 
             match arg.parse::<CommandType>() {
                 Ok(c @ CommandType::Help) => {
-                    println!(":{} [command]", c);
-                    print_aliases(c);
-                    println!(
+                    writeln!(out, ":{} [command]", c)?;
+                    print_aliases(out, c)?;
+                    writeln!(
+                        out,
                         "Prints a list of available commands or the help of the given command"
-                    );
+                    )?;
                 }
                 Ok(c @ CommandType::Query) => {
-                    println!(":{} <expression>", c);
-                    print_aliases(c);
-                    println!("Print the metadata attached to an attribute");
+                    writeln!(out, ":{} <expression>", c)?;
+                    print_aliases(out, c)?;
+                    writeln!(out, "Print the metadata attached to an attribute")?;
                 }
                 Ok(c @ CommandType::Load) => {
-                    println!(":{} <file>", c);
-                    print_aliases(c);
-                    print!("Evaluate the content of <file> to a record and load its attributes in the environment.");
-                    println!(" Fail if the content of <file> doesn't evaluate to a record");
+                    writeln!(out, ":{} <file>", c)?;
+                    print_aliases(out, c)?;
+                    write!(out,"Evaluate the content of <file> to a record and load its attributes in the environment.")?;
+                    writeln!(
+                        out,
+                        " Fail if the content of <file> doesn't evaluate to a record"
+                    )?;
                 }
                 Ok(c @ CommandType::Typecheck) => {
-                    println!(":{} <expression>", c);
-                    print_aliases(c);
-                    println!("Typecheck the given expression and print its top-level type");
+                    writeln!(out, ":{} <expression>", c)?;
+                    print_aliases(out, c)?;
+                    writeln!(
+                        out,
+                        "Typecheck the given expression and print its top-level type"
+                    )?;
                 }
                 Ok(c @ CommandType::Exit) => {
-                    println!(":{}", c);
-                    print_aliases(c);
-                    println!("Exit the REPL session");
+                    writeln!(out, ":{}", c)?;
+                    print_aliases(out, c)?;
+                    writeln!(out, "Exit the REPL session")?;
                 }
                 Err(UnknownCommandError {}) => {
-                    println!("Unknown command `{}`.", arg);
-                    println!("Available commands: ? help query load typecheck");
+                    writeln!(out, "Unknown command `{}`.", arg)?;
+                    writeln!(out, "Available commands: ? help query load typecheck")?;
                 }
-            }
+            };
+
+            Ok(())
         } else {
-            println!("Available commands: help query load typecheck exit");
+            writeln!(out, "Available commands: help query load typecheck exit")
         }
     }
 }
@@ -531,16 +644,17 @@ pub mod rustyline_frontend {
 pub mod query_print {
     use crate::identifier::Ident;
     use crate::term::{MergePriority, MetaValue, Term};
+    use std::{io, io::Write};
 
     /// A query printer. The implementation may differ depending on the activation of markdown
     /// support.
     pub trait QueryPrinter {
         /// Print a metadata attribute.
-        fn print_metadata(&self, attr: &str, value: &str);
+        fn write_metadata(&self, &mut out: impl Write, attr: &str, value: &str) -> io::Result<()>;
         /// Print the documentation attribute.
-        fn print_doc(&self, content: &str);
+        fn write_doc(&self, &mut out: impl Write, content: &str) -> io::Result<()>;
         /// Print the list of fields of a record.
-        fn print_fields<'a, I>(&self, fields: I)
+        fn write_fields<'a, I>(&self, &mut out: impl Write, fields: I) -> io::Result<()>
         where
             I: Iterator<Item = &'a Ident>;
     }
@@ -554,28 +668,30 @@ pub mod query_print {
 
     /// Helper to render the result of the `query` sub-command without markdown support.
     impl QueryPrinter for SimpleRenderer {
-        fn print_metadata(&self, attr: &str, value: &str) {
-            println!("* {}: {}", attr, value);
+        fn write_metadata(&self, &mut out: impl Write, attr: &str, value: &str) -> io::Result<()> {
+            writeln!(out, "* {}: {}", attr, value)
         }
 
-        fn print_doc(&self, content: &str) {
+        fn write_doc(&self, &mut out: impl Write, content: &str) -> io::Result<()> {
             if content.find('\n').is_none() {
-                self.print_metadata("documentation", &content);
+                self.write_metadata(out, "documentation", &content)
             } else {
-                println!("* documentation\n");
-                println!("{}", content);
+                writeln!(out, "* documentation\n")?;
+                writeln!(out, "{}", content)
             }
         }
 
-        fn print_fields<'a, I>(&self, fields: I)
+        fn write_fields<'a, I>(&self, &mut out: impl Write, fields: I) -> io::Result<()>
         where
             I: Iterator<Item = &'a Ident>,
         {
-            println!("Available fields:");
+            writeln!(out, "Available fields:")?;
 
             for field in fields {
-                println!(" - {}", field);
+                writeln!(out, " - {}", field)?;
             }
+
+            Ok(())
         }
     }
 
@@ -588,10 +704,11 @@ pub mod query_print {
         }
     }
 
-    /// Helper to render the result of the `query` sub-command with markdown support.
+    /// Helper to render the result of the `query` sub-command with markdown support on the
+    /// terminal.
     #[cfg(feature = "markdown")]
     impl QueryPrinter for MarkdownRenderer {
-        fn print_metadata(&self, attr: &str, value: &str) {
+        fn write_metadata(&self, &mut out: impl Write, attr: &str, value: &str) -> io::Result<()> {
             use minimad::*;
             use termimad::*;
 
@@ -603,20 +720,20 @@ pub mod query_print {
             let text = expander.expand(&template);
             let (width, _) = terminal_size();
             let fmt_text = FmtText::from_text(&self.skin, text, Some(width as usize));
-            print!("{}", fmt_text);
+            write!(out, "{}", fmt_text)
         }
 
-        fn print_doc(&self, content: &str) {
+        fn write_doc(&self, &mut out: impl Write, content: &str) -> io::Result<()> {
             if content.find('\n').is_none() {
                 self.skin
-                    .print_text(&format!("* **documentation**: {}", content));
+                    .write_text_on(out, &format!("* **documentation**: {}", content))?
             } else {
-                self.skin.print_text("* **documentation**\n\n");
-                self.skin.print_text(content);
+                self.skin.write_text_on(out, "* **documentation**\n\n")?;
+                self.skin.write_text_on(out, content)
             }
         }
 
-        fn print_fields<'a, I>(&self, fields: I)
+        fn write_fields<'a, I>(&self, &mut out: impl Write, fields: I) -> io::Result<()>
         where
             I: Iterator<Item = &'a Ident>,
         {
@@ -627,14 +744,16 @@ pub mod query_print {
             let mut expander = OwningTemplateExpander::new();
             let template = TextTemplate::from("* ${field}");
 
-            self.skin.print_text("## Available fields");
+            self.skin.write_text_on(out, "## Available fields")?;
 
             for field in fields {
                 expander.set("field", field.to_string());
                 let text = expander.expand(&template);
                 let fmt_text = FmtText::from_text(&self.skin, text, Some(width as usize));
-                print!("{}", fmt_text);
+                write!(out, "{}", fmt_text)?;
             }
+
+            Ok(())
         }
     }
 
@@ -664,30 +783,30 @@ pub mod query_print {
     ///
     /// Wrapper around [`print_query_result_`](./fn.print_query_result_) that selects an adapated
     /// query printer at compile time.
-    pub fn print_query_result(term: &Term, selected_attrs: Attributes) {
+    pub fn write_query_result(&mut out: impl Write, term: &Term, selected_attrs: Attributes) -> io::Result<()> {
         #[cfg(feature = "markdown")]
         let renderer = MarkdownRenderer::new();
 
         #[cfg(not(feature = "markdown"))]
         let renderer = SimpleRenderer {};
 
-        print_query_result_(term, selected_attrs, &renderer)
+        write_query_result_(&mut out, term, selected_attrs, &renderer)
     }
 
     /// Print the result of a metadata query, which is a "weakly" evaluated term (see
     /// [`eval_meta`](../../eval/fn.eval_meta.html) and [`query`](../../program/fn.query.html)).
-    fn print_query_result_<R: QueryPrinter>(term: &Term, selected_attrs: Attributes, renderer: &R) {
+    fn write_query_result_<R: QueryPrinter>(&mut out: impl Write, term: &Term, selected_attrs: Attributes, renderer: &R) -> io::Result<()> {
         // Print a list the fields of a term if it is a record, or do nothing otherwise.
-        fn print_fields<R: QueryPrinter>(renderer: &R, t: &Term) {
-            println!();
+        fn write_fields<R: QueryPrinter>(&mut out: impl Write, renderer: &R, t: &Term) -> io::Result<()> {
+            writeln!(out)?;
             match t {
                 Term::Record(map) | Term::RecRecord(map) if !map.is_empty() => {
                     let mut fields: Vec<_> = map.keys().collect();
                     fields.sort();
-                    renderer.print_fields(fields.into_iter());
+                    renderer.write_fields(out, fields.into_iter())
                 }
-                Term::Record(_) | Term::RecRecord(_) => renderer.print_metadata("value", "{}"),
-                _ => (),
+                Term::Record(_) | Term::RecRecord(_) => renderer.write_metadata(out, "value", "{}"),
+                _ => Ok(()),
             }
         }
 
@@ -703,7 +822,7 @@ pub mod query_print {
                         // altered by closurizations or other run-time rewriting
                         .map(|ctr| ctr.label.types.to_string())
                         .collect();
-                    renderer.print_metadata("contract", &ctrs.join(","));
+                    renderer.write_metadata(out, "contract", &ctrs.join(","))?;
                     found = true;
                 }
 
@@ -713,7 +832,7 @@ pub mod query_print {
                         value: Some(t),
                         ..
                     } if selected_attrs.default => {
-                        renderer.print_metadata("default", &t.as_ref().shallow_repr());
+                        renderer.write_metadata(out, "default", &t.as_ref().shallow_repr())?;
                         found = true;
                     }
                     MetaValue {
@@ -721,7 +840,7 @@ pub mod query_print {
                         value: Some(t),
                         ..
                     } if selected_attrs.value => {
-                        renderer.print_metadata("value", &t.as_ref().shallow_repr());
+                        renderer.write_metadata(out, "value", &t.as_ref().shallow_repr())?;
                         found = true;
                     }
                     _ => (),
@@ -729,7 +848,7 @@ pub mod query_print {
 
                 match meta.doc {
                     Some(ref s) if selected_attrs.doc => {
-                        renderer.print_doc(s);
+                        renderer.write_doc(out, s)?;
                         found = true;
                     }
                     _ => (),
@@ -739,23 +858,25 @@ pub mod query_print {
                     println!("Requested metadata were not found for this value.");
                     meta.value
                         .iter()
-                        .for_each(|rt| print_fields(renderer, rt.as_ref()));
+                        .try_for_each(|rt| write_fields(out, renderer, rt.as_ref()))?;
                 }
 
                 meta.value
                     .iter()
-                    .for_each(|rt| print_fields(renderer, rt.as_ref()));
+                    .try_for_each(|rt| write_fields(out, renderer, rt.as_ref()))?;
             }
             t @ Term::Record(_) | t @ Term::RecRecord(_) => {
-                println!("No metadata found for this value.");
-                print_fields(renderer, &t)
+                writeln!(out, "No metadata found for this value.")?;
+                write_fields(out, renderer, &t)?;
             }
             t => {
-                println!("No metadata found for this value.\n");
+                writeln!(out, "jo metadata found for this value.\n")?;
                 if selected_attrs.value {
-                    renderer.print_metadata("value", &t.shallow_repr());
+                    renderer.write_metadata(out, "value", &t.shallow_repr())?;
                 }
             }
-        }
+        };
+
+        Ok(())
     }
 }
