@@ -20,7 +20,7 @@ use std::result::Result;
 use std::str::FromStr;
 
 #[cfg(feature = "repl")]
-use rustyline::validate::{ValidationContext, ValidationResult, Validator};
+use rustyline::validate::{ValidationContext, ValidationResult};
 
 generate_counter!(InputNameCounter, usize);
 
@@ -390,17 +390,14 @@ impl rustyline::validate::Validator for InputParser {
 /// Native terminal implementation of an REPL frontend using rustyline.
 #[cfg(feature = "repl")]
 pub mod rustyline_frontend {
-    use super::command::{Command, CommandType, UnknownCommandError};
+    use super::command::Command;
     use super::*;
 
-    use crate::error::ParseError;
     use crate::program;
     use ansi_term::{Colour, Style};
-    use codespan::FileId;
     use rustyline::config::OutputStreamType;
     use rustyline::error::ReadlineError;
     use rustyline::{Config, EditMode, Editor};
-    use rustyline_derive::{Completer, Helper, Highlighter, Hinter};
 
     /// The config of rustyline's editor.
     pub fn config() -> Config {
@@ -436,8 +433,7 @@ pub mod rustyline_frontend {
                 editor.add_history_entry(line.clone());
             }
 
-
-            let stdout = std::io::stdout();
+            let mut stdout = std::io::stdout();
 
             match line {
                 Ok(line) if line.trim().is_empty() => (),
@@ -456,10 +452,16 @@ pub mod rustyline_frontend {
                             repl.typecheck(&exp).map(|types| println!("Ok: {}", types))
                         }
                         Ok(Command::Query(exp)) => repl.query(&exp).map(|t| {
-                            query_print::write_query_result(&mut stdout, &t, query_print::Attributes::default());
+                            query_print::write_query_result(
+                                &mut stdout,
+                                &t,
+                                query_print::Attributes::default(),
+                            )
+                            .unwrap();
                         }),
                         Ok(Command::Help(arg)) => {
-                            simple_frontend::print_help(&mut std::io::stdout(), arg.as_deref()).unwrap();
+                            simple_frontend::print_help(&mut std::io::stdout(), arg.as_deref())
+                                .unwrap();
                             Ok(())
                         }
                         Ok(Command::Exit) => {
@@ -503,11 +505,12 @@ pub mod rustyline_frontend {
 pub mod simple_frontend {
     use super::command::{Command, CommandType, UnknownCommandError};
     use super::*;
-    use crate::error::ParseError;
+    use crate::error::ToDiagnostic;
     use crate::program;
+    use ansi_term::Style;
     use codespan::FileId;
-    use std::fmt::Formatter;
-    use std::io::{Write, Cursor};
+    use codespan_reporting::term::termcolor::Ansi;
+    use std::io::{Cursor, Write};
 
     pub enum InputResult {
         Success(String),
@@ -529,50 +532,71 @@ pub mod simple_frontend {
         Ok(repl)
     }
 
-    pub fn input<R : REPL>(repl: &mut R, line: &str) -> Result<InputResult, String> {
-              if line.trim().is_empty() {
-                  Ok(InputResult::Blank)
-              }
-              else if line.starts_with(':') {
-                  let cmd = line.chars().skip(1).collect::<String>().parse::<Command>();
-                  let result = match cmd {
-                      Ok(Command::Load(path)) => {
-                        return Err(String::from(":load is not enabled on the online REPL.")); 
-                      }
-                      Ok(Command::Typecheck(exp)) => {
-                          repl.typecheck(&exp).map(|types| InputResult::Success(format!("Ok: {}", types)))
-                      }
-                      Ok(Command::Query(exp)) =>
-                          repl.query(&exp).map(|t| {  
-                              let mut buffer = Cursor::new(Vec::<u8>::new());
-                              query_print::write_query_result(&mut buffer, &t, query_print::Attributes::default());
-                              InputResult::Success(buffer.into_inner().try_into().unwrap())
-                      }),
-                      Ok(Command::Help(arg)) => {
-                          let mut buffer = Cursor::new(Vec::<u8>::new());
-                          simple_frontend::print_help(&mut , arg.as_deref()).unwrap();
-                          Ok(())
-                      }
-                      Ok(Command::Exit) => {
-                          println!("{}", Style::new().bold().paint("Exiting"));
-                          return Ok(());
-                      }
-                      Err(err) => Err(Error::from(err)),
-                  };
+    pub fn err_to_str<E: ToDiagnostic<FileId>>(cache: &mut Cache, err: E) -> String {
+        let mut buffer = Ansi::new(Cursor::new(Vec::new()));
+        let config = codespan_reporting::term::Config::default();
+        let contracts_id = cache.id_of("<stdlib/contracts.ncl>");
+        let diagnostics = err.to_diagnostic(cache.files_mut(), contracts_id);
 
-                  if let Err(err) = result {
-                      program::report(repl.cache_mut(), err);
-                  } else {
-                      println!();
-                  }
-              }
-              else {
-                  match repl.eval(&line) {
-                      Ok(EvalResult::Evaluated(t)) => Ok(InputResult::Success(format!("{}\n", t.shallow_repr()))),
-                      Ok(EvalResult::Bound(_)) => Ok(InputResult::Success(String::new())),
-                      Err(err) => Err(err.to_diagnostic().to_string()),
-                  }
-              }
+        diagnostics
+            .iter()
+            .try_for_each(|d| {
+                codespan_reporting::term::emit(&mut buffer, &config, cache.files_mut(), &d)
+            })
+            .unwrap();
+
+        String::from_utf8(buffer.into_inner().into_inner()).unwrap()
+    }
+
+    pub fn input<R: REPL>(repl: &mut R, line: &str) -> Result<InputResult, String> {
+        if line.trim().is_empty() {
+            Ok(InputResult::Blank)
+        } else if line.starts_with(':') {
+            let cmd = line.chars().skip(1).collect::<String>().parse::<Command>();
+            let result = match cmd {
+                Ok(Command::Load(_)) => {
+                    return Err(String::from(":load is not enabled on the online REPL."));
+                }
+                Ok(Command::Typecheck(exp)) => repl
+                    .typecheck(&exp)
+                    .map(|types| InputResult::Success(format!("Ok: {}", types))),
+                Ok(Command::Query(exp)) => repl.query(&exp).map(|t| {
+                    let mut buffer = Cursor::new(Vec::<u8>::new());
+                    query_print::write_query_result(
+                        &mut buffer,
+                        &t,
+                        query_print::Attributes::default(),
+                    )
+                    .unwrap();
+                    InputResult::Success(String::from_utf8(buffer.into_inner()).unwrap())
+                }),
+                Ok(Command::Help(arg)) => {
+                    let mut buffer = Cursor::new(Vec::<u8>::new());
+                    simple_frontend::print_help(&mut buffer, arg.as_deref()).unwrap();
+                    Ok(InputResult::Success(
+                        String::from_utf8(buffer.into_inner()).unwrap(),
+                    ))
+                }
+                Ok(Command::Exit) => Ok(InputResult::Success(format!(
+                    "{}",
+                    Style::new().bold().paint("Exiting")
+                ))),
+                Err(err) => Err(Error::from(err)),
+            };
+
+            Ok(
+                result
+                    .unwrap_or_else(|err| InputResult::Success(err_to_str(repl.cache_mut(), err))),
+            )
+        } else {
+            match repl.eval(&line) {
+                Ok(EvalResult::Evaluated(t)) => {
+                    Ok(InputResult::Success(format!("{}\n", t.shallow_repr())))
+                }
+                Ok(EvalResult::Bound(_)) => Ok(InputResult::Success(String::new())),
+                Err(err) => Ok(InputResult::Success(err_to_str(repl.cache_mut(), err))),
+            }
+        }
     }
 
     /// Print the help message corresponding to a command, or show a list of available commands if
@@ -650,11 +674,11 @@ pub mod query_print {
     /// support.
     pub trait QueryPrinter {
         /// Print a metadata attribute.
-        fn write_metadata(&self, &mut out: impl Write, attr: &str, value: &str) -> io::Result<()>;
+        fn write_metadata(&self, out: &mut impl Write, attr: &str, value: &str) -> io::Result<()>;
         /// Print the documentation attribute.
-        fn write_doc(&self, &mut out: impl Write, content: &str) -> io::Result<()>;
+        fn write_doc(&self, out: &mut impl Write, content: &str) -> io::Result<()>;
         /// Print the list of fields of a record.
-        fn write_fields<'a, I>(&self, &mut out: impl Write, fields: I) -> io::Result<()>
+        fn write_fields<'a, I>(&self, out: &mut impl Write, fields: I) -> io::Result<()>
         where
             I: Iterator<Item = &'a Ident>;
     }
@@ -668,11 +692,11 @@ pub mod query_print {
 
     /// Helper to render the result of the `query` sub-command without markdown support.
     impl QueryPrinter for SimpleRenderer {
-        fn write_metadata(&self, &mut out: impl Write, attr: &str, value: &str) -> io::Result<()> {
+        fn write_metadata(&self, out: &mut impl Write, attr: &str, value: &str) -> io::Result<()> {
             writeln!(out, "* {}: {}", attr, value)
         }
 
-        fn write_doc(&self, &mut out: impl Write, content: &str) -> io::Result<()> {
+        fn write_doc(&self, out: &mut impl Write, content: &str) -> io::Result<()> {
             if content.find('\n').is_none() {
                 self.write_metadata(out, "documentation", &content)
             } else {
@@ -681,7 +705,7 @@ pub mod query_print {
             }
         }
 
-        fn write_fields<'a, I>(&self, &mut out: impl Write, fields: I) -> io::Result<()>
+        fn write_fields<'a, I>(&self, out: &mut impl Write, fields: I) -> io::Result<()>
         where
             I: Iterator<Item = &'a Ident>,
         {
@@ -704,11 +728,20 @@ pub mod query_print {
         }
     }
 
+    fn termimad_to_io(err: termimad::Error) -> io::Error {
+        match err {
+            termimad::Error::IO(err) => err,
+            termimad::Error::Crossterm(err) => {
+                io::Error::new(io::ErrorKind::Other, err.to_string())
+            }
+        }
+    }
+
     /// Helper to render the result of the `query` sub-command with markdown support on the
     /// terminal.
     #[cfg(feature = "markdown")]
     impl QueryPrinter for MarkdownRenderer {
-        fn write_metadata(&self, &mut out: impl Write, attr: &str, value: &str) -> io::Result<()> {
+        fn write_metadata(&self, out: &mut impl Write, attr: &str, value: &str) -> io::Result<()> {
             use minimad::*;
             use termimad::*;
 
@@ -723,17 +756,22 @@ pub mod query_print {
             write!(out, "{}", fmt_text)
         }
 
-        fn write_doc(&self, &mut out: impl Write, content: &str) -> io::Result<()> {
+        fn write_doc(&self, out: &mut impl Write, content: &str) -> io::Result<()> {
             if content.find('\n').is_none() {
                 self.skin
-                    .write_text_on(out, &format!("* **documentation**: {}", content))?
+                    .write_text_on(out, &format!("* **documentation**: {}", content))
+                    .map_err(termimad_to_io)
             } else {
-                self.skin.write_text_on(out, "* **documentation**\n\n")?;
-                self.skin.write_text_on(out, content)
+                self.skin
+                    .write_text_on(out, "* **documentation**\n\n")
+                    .map_err(termimad_to_io)?;
+                self.skin
+                    .write_text_on(out, content)
+                    .map_err(termimad_to_io)
             }
         }
 
-        fn write_fields<'a, I>(&self, &mut out: impl Write, fields: I) -> io::Result<()>
+        fn write_fields<'a, I>(&self, out: &mut impl Write, fields: I) -> io::Result<()>
         where
             I: Iterator<Item = &'a Ident>,
         {
@@ -744,7 +782,9 @@ pub mod query_print {
             let mut expander = OwningTemplateExpander::new();
             let template = TextTemplate::from("* ${field}");
 
-            self.skin.write_text_on(out, "## Available fields")?;
+            self.skin
+                .write_text_on(out, "## Available fields")
+                .map_err(termimad_to_io)?;
 
             for field in fields {
                 expander.set("field", field.to_string());
@@ -783,21 +823,34 @@ pub mod query_print {
     ///
     /// Wrapper around [`print_query_result_`](./fn.print_query_result_) that selects an adapated
     /// query printer at compile time.
-    pub fn write_query_result(&mut out: impl Write, term: &Term, selected_attrs: Attributes) -> io::Result<()> {
+    pub fn write_query_result(
+        out: &mut impl Write,
+        term: &Term,
+        selected_attrs: Attributes,
+    ) -> io::Result<()> {
         #[cfg(feature = "markdown")]
         let renderer = MarkdownRenderer::new();
 
         #[cfg(not(feature = "markdown"))]
         let renderer = SimpleRenderer {};
 
-        write_query_result_(&mut out, term, selected_attrs, &renderer)
+        write_query_result_(out, term, selected_attrs, &renderer)
     }
 
     /// Print the result of a metadata query, which is a "weakly" evaluated term (see
     /// [`eval_meta`](../../eval/fn.eval_meta.html) and [`query`](../../program/fn.query.html)).
-    fn write_query_result_<R: QueryPrinter>(&mut out: impl Write, term: &Term, selected_attrs: Attributes, renderer: &R) -> io::Result<()> {
+    fn write_query_result_<R: QueryPrinter>(
+        out: &mut impl Write,
+        term: &Term,
+        selected_attrs: Attributes,
+        renderer: &R,
+    ) -> io::Result<()> {
         // Print a list the fields of a term if it is a record, or do nothing otherwise.
-        fn write_fields<R: QueryPrinter>(&mut out: impl Write, renderer: &R, t: &Term) -> io::Result<()> {
+        fn write_fields<R: QueryPrinter>(
+            out: &mut impl Write,
+            renderer: &R,
+            t: &Term,
+        ) -> io::Result<()> {
             writeln!(out)?;
             match t {
                 Term::Record(map) | Term::RecRecord(map) if !map.is_empty() => {
